@@ -70,3 +70,17 @@ class BatchCreate(BaseModel):
         if not value:
             raise ValueError("request_key 不能为空")
         return value
+
+
+class ReversalCreate(BaseModel):
+    """撤销一批已提交移液：request_key 用于撤销操作的幂等去重。"""
+
+    request_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
+        return value

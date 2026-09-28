@@ -49,6 +49,45 @@ CREATE TABLE IF NOT EXISTS operations (
 
 CREATE INDEX IF NOT EXISTS idx_operations_batch ON operations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_operations_well ON operations(source, destination);
+
+-- 孔位变更事件流：批次提交与补液各记一条，自增 id 即发生顺序，
+-- 用于判断批次之后是否有补液或后续批次触及同一孔位。
+CREATE TABLE IF NOT EXISTS well_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    well       TEXT NOT NULL,
+    type       TEXT NOT NULL CHECK (type IN ('top_up', 'batch')),
+    batch_id   INTEGER REFERENCES batches(id),
+    sample     TEXT,
+    volume     TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_well_events_well ON well_events(well, id);
+
+-- 成功提交批次时，在同一事务内保存其首次触及各孔的批前快照。
+-- volume 为 NULL 表示该孔在批次之前尚不存在（撤销时整体删除）。
+CREATE TABLE IF NOT EXISTS batch_well_snapshots (
+    batch_id INTEGER NOT NULL REFERENCES batches(id),
+    well     TEXT NOT NULL,
+    volume   TEXT,
+    PRIMARY KEY (batch_id, well)
+);
+
+CREATE TABLE IF NOT EXISTS batch_snapshot_composition (
+    batch_id  INTEGER NOT NULL REFERENCES batches(id),
+    well      TEXT NOT NULL,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    amount    TEXT NOT NULL,
+    PRIMARY KEY (batch_id, well, sample_id)
+);
+
+-- 批次撤销审计记录：不删除原批次，只追加一条关联记录。
+CREATE TABLE IF NOT EXISTS reversals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL UNIQUE REFERENCES batches(id),
+    request_key TEXT NOT NULL UNIQUE,
+    reversed_at TEXT NOT NULL
+);
 """
 
 

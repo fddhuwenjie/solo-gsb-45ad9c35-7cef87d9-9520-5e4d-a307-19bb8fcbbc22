@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 
 from . import db as db_module
 from . import ledger
-from .schemas import BatchCreate, WellCreate
+from .schemas import BatchCreate, ReversalCreate, WellCreate
 
 
 @asynccontextmanager
@@ -139,3 +139,77 @@ def get_batch(batch_id: int, conn: sqlite3.Connection = Depends(get_db)) -> dict
     if row is None:
         raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在")
     return ledger.batch_payload(conn, batch_id)
+
+
+@app.post("/batches/{batch_id}/reversals")
+def reverse_batch(
+    batch_id: int,
+    payload: ReversalCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """撤销一个已提交批次：原子恢复其批前快照并追加审计记录，不删除原批次。
+
+    仅当目标批次已提交、尚未撤销、保存了批前快照，且之后没有补液或已提交
+    批次触及相关孔位时可撤销；条件不符返回 409 并列出阻塞孔位与后续操作，
+    液体状态保持不变。request_key 幂等：同键同目标返回首次结果（200），
+    同键换目标返回 409。
+    """
+    existing = ledger.find_reversal_by_key(conn, payload.request_key)
+    if existing is not None:
+        if int(existing["batch_id"]) != batch_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        f"request_key {payload.request_key} 已用于撤销批次 "
+                        f"{existing['batch_id']}，不能再用于批次 {batch_id}"
+                    ),
+                    "reason": "request_key_conflict",
+                    "batch_id": batch_id,
+                    "existing_batch_id": int(existing["batch_id"]),
+                },
+            )
+        response.status_code = 200
+        return ledger.get_reversal(conn, int(existing["id"]), replayed=True)
+
+    try:
+        with conn:  # 校验、快照恢复与审计记录同一事务：冲突或异常即整体回滚
+            reversal_id = ledger.apply_reversal(conn, batch_id, payload.request_key)
+    except ledger.ReversalConflict as exc:
+        if exc.reason == "not_found":
+            raise HTTPException(status_code=404, detail=exc.message)
+        detail: dict = {"message": exc.message, "reason": exc.reason, "batch_id": batch_id}
+        if exc.blockers:
+            detail["blocking_wells"] = exc.blockers
+        raise HTTPException(status_code=409, detail=detail)
+    except sqlite3.IntegrityError:
+        # 并发下 request_key 或批次撤销状态已被另一请求写入
+        row = ledger.find_reversal_by_key(conn, payload.request_key)
+        if row is not None:
+            if int(row["batch_id"]) != batch_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": (
+                            f"request_key {payload.request_key} 已用于撤销批次 "
+                            f"{row['batch_id']}，不能再用于批次 {batch_id}"
+                        ),
+                        "reason": "request_key_conflict",
+                        "batch_id": batch_id,
+                        "existing_batch_id": int(row["batch_id"]),
+                    },
+                )
+            response.status_code = 200
+            return ledger.get_reversal(conn, int(row["id"]), replayed=True)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"批次 {batch_id} 已经撤销，不能重复撤销",
+                "reason": "already_reversed",
+                "batch_id": batch_id,
+            },
+        )
+
+    response.status_code = 201
+    return ledger.get_reversal(conn, reversal_id)

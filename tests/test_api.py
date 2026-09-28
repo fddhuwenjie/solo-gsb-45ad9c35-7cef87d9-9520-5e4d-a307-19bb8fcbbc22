@@ -1,5 +1,6 @@
 """端到端 API 测试。"""
 
+import sqlite3
 from decimal import Decimal
 
 
@@ -386,3 +387,293 @@ def test_transfer_cannot_exceed_component_amount(client):
         "S1": Decimal("0.000000005"),
         "S2": Decimal("0.000000003"),
     }
+
+
+# ------------------------------------------------ 误操作批次撤销
+
+
+def reverse(client, batch_id, request_key):
+    return client.post(
+        f"/batches/{batch_id}/reversals", json={"request_key": request_key}
+    )
+
+
+def committed_batch_id(client, request_key, source, destination, volume):
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": request_key,
+            "operations": [{"source": source, "destination": destination, "volume": volume}],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["batch_id"]
+
+
+def test_reversal_restores_wells_and_keeps_batch(client):
+    register(client, "A1", "S1", "100")
+    register(client, "A2", "S2", "60")
+    bid = committed_batch_id(client, "r1", "A1", "B1", "40")
+    # 另一批次只触及 A2/D1，不影响本批撤销
+    committed_batch_id(client, "r1-other", "A2", "D1", "30")
+    assert client.get("/wells/B1").json()["volume"] == "40"
+
+    resp = reverse(client, bid, "rev-r1")
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["batch_id"] == bid
+    assert body["replayed"] is False
+    assert body["restored_wells"] == ["A1", "B1"]
+    assert body["batch"]["reversed"] is True
+
+    # 所有快照孔原子恢复：A1 满量；该批新建的 B1 被删除（A2 不属本批，保持 30）
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    assert client.get("/wells/B1").status_code == 404
+    assert client.get("/wells/A2").json()["volume"] == "30"
+    assert client.get("/wells/D1").json()["volume"] == "30"
+
+    # 原批次不删除，仅标记 reversed
+    batch = client.get(f"/batches/{bid}").json()
+    assert batch["status"] == "committed"
+    assert batch["reversed"] is True
+    assert len(batch["operations"]) == 1
+    assert client.get("/batches").json()["batches"][0]["batch_id"] == bid
+    # 现有查询不变：按孔仍能查到原批次的完整操作
+    history = client.get("/wells/A1/batches").json()["batches"]
+    assert [b["batch_id"] for b in history] == [bid]
+    assert history[0]["operations"][0]["destination"] == "B1"
+
+
+def test_reversal_restores_preexisting_destination_and_decimal_amounts(client):
+    register(client, "A1", "S1", "0.000000003")
+    register(client, "B1", "S2", "0.000000002")
+    bid = committed_batch_id(client, "r-dec", "A1", "B1", "0.000000003")
+    # B1 批前已存在：快照保留，撤销后恢复为只有 2 单位 S2
+    assert amounts(client.get("/wells/B1").json()) == {
+        "S1": Decimal("0.000000003"),
+        "S2": Decimal("0.000000002"),
+    }
+
+    assert reverse(client, bid, "rev-dec").status_code == 201
+    b1 = assert_invariant(client, "B1")
+    assert b1["volume"] == "0.000000002"
+    assert amounts(b1) == {"S2": Decimal("0.000000002")}
+    a1 = assert_invariant(client, "A1")
+    assert a1["volume"] == "0.000000003"
+    assert amounts(a1) == {"S1": Decimal("0.000000003")}
+
+
+def test_reversal_blocked_by_later_batch_lists_blocking_wells(client):
+    register(client, "A1", "S1", "100")
+    first = committed_batch_id(client, "blk-1", "A1", "B1", "40")
+    # 后续批次同时触及 A1 与 B1，构成阻塞
+    second_resp = client.post(
+        "/batches",
+        json={
+            "request_key": "blk-2",
+            "operations": [{"source": "A1", "destination": "B1", "volume": "10"}],
+        },
+    )
+    second = second_resp.json()["batch_id"]
+
+    resp = reverse(client, first, "rev-blk")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "blocked"
+    expected_event = {"type": "batch", "batch_id": second, "request_key": "blk-2"}
+    wells = {b["well"]: b["events"] for b in detail["blocking_wells"]}
+    assert set(wells) == {"A1", "B1"}
+    assert wells["A1"] == [expected_event]
+    assert wells["B1"] == [expected_event]
+
+    # 液体状态保持不变
+    assert client.get("/wells/A1").json()["volume"] == "50"
+    assert client.get("/wells/B1").json()["volume"] == "50"
+    # 冲突后同键可重新尝试（键未被消耗）
+    assert reverse(client, first, "rev-blk").status_code == 409
+
+
+def test_reversal_blocked_by_later_top_up(client):
+    register(client, "A1", "S1", "100")
+    bid = committed_batch_id(client, "top-1", "A1", "B1", "40")
+    # 对来源孔补液
+    register(client, "A1", "S1", "5")
+
+    resp = reverse(client, bid, "rev-top")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "blocked"
+    events = {b["well"]: b["events"] for b in detail["blocking_wells"]}["A1"]
+    assert events == [{"type": "top_up", "sample": "S1", "volume": "5"}]
+    # 液体状态保持不变
+    assert client.get("/wells/A1").json()["volume"] == "65"
+
+
+def test_unrelated_later_batch_does_not_block(client):
+    register(client, "A1", "S1", "100")
+    register(client, "D1", "S9", "10")
+    bid = committed_batch_id(client, "iso-1", "A1", "B1", "40")
+    committed_batch_id(client, "iso-2", "D1", "E1", "5")
+    resp = reverse(client, bid, "rev-iso")
+    assert resp.status_code == 201, resp.text
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    assert client.get("/wells/B1").status_code == 404
+    assert client.get("/wells/D1").json()["volume"] == "5"
+
+
+def test_reversal_is_idempotent_same_key_same_target(client):
+    register(client, "A1", "S1", "100")
+    bid = committed_batch_id(client, "idem-1", "A1", "B1", "40")
+    first = reverse(client, bid, "rev-idem")
+    assert first.status_code == 201
+    first_body = first.json()
+
+    second = reverse(client, bid, "rev-idem")
+    assert second.status_code == 200
+    body = second.json()
+    assert body["replayed"] is True
+    assert body["reversal_id"] == first_body["reversal_id"]
+    # 状态稳定
+    assert client.get("/wells/A1").json()["volume"] == "100"
+
+
+def test_reversal_same_key_other_target_conflicts(client):
+    register(client, "A1", "S1", "100")
+    register(client, "A2", "S2", "50")
+    b1 = committed_batch_id(client, "key-1", "A1", "C1", "10")
+    b2 = committed_batch_id(client, "key-2", "A2", "C2", "10")
+    assert reverse(client, b1, "shared-rev-key").status_code == 201
+
+    resp = reverse(client, b2, "shared-rev-key")
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "request_key_conflict"
+    assert detail["existing_batch_id"] == b1
+    # 第二个批次未被撤销，液体不变
+    assert client.get(f"/batches/{b2}").json()["reversed"] is False
+    assert client.get("/wells/A2").json()["volume"] == "40"
+
+
+def test_already_reversed_batch_conflicts(client):
+    register(client, "A1", "S1", "100")
+    bid = committed_batch_id(client, "dbl-1", "A1", "B1", "40")
+    assert reverse(client, bid, "rev-dbl-1").status_code == 201
+    resp = reverse(client, bid, "rev-dbl-2")
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "already_reversed"
+    assert client.get("/wells/A1").json()["volume"] == "100"
+
+
+def test_failed_batch_cannot_be_reversed(client):
+    register(client, "A1", "S1", "10")
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": "rev-fail",
+            "operations": [{"source": "A1", "destination": "B1", "volume": "50"}],
+        },
+    )
+    assert resp.status_code == 409
+    failed_id = resp.json()["detail"]["batch_id"]
+    rev = reverse(client, failed_id, "rev-of-failed")
+    assert rev.status_code == 409
+    assert rev.json()["detail"]["reason"] == "not_committed"
+
+
+def test_reversal_unknown_batch_is_404(client):
+    assert reverse(client, 999, "rev-ghost").status_code == 404
+
+
+def test_legacy_batch_without_snapshot_cannot_be_reversed(client):
+    import os
+
+    db_file = os.environ["LINEAGE_DB"]
+    # 模拟上线前已提交的批次：直接写批次/操作记录，但没有快照
+    conn = sqlite3.connect(db_file)
+    try:
+        cur = conn.execute(
+            "INSERT INTO batches (request_key, status, error, created_at) "
+            "VALUES ('legacy-1', 'committed', NULL, '2026-01-01T00:00:00+00:00')"
+        )
+        legacy_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO operations (batch_id, step, source, destination, volume) "
+            "VALUES (?, 1, 'A1', 'B1', '10')",
+            (legacy_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    resp = reverse(client, legacy_id, "rev-legacy")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "no_snapshot"
+    assert "快照" in detail["message"]
+
+
+def test_reversal_multi_step_batch_restores_all_snapshots(client):
+    register(client, "A1", "S1", "100")
+    register(client, "A2", "S2", "60")
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": "multi-1",
+            "operations": [
+                {"source": "A1", "destination": "B1", "volume": "40"},
+                {"source": "A2", "destination": "B1", "volume": "30"},
+                {"source": "B1", "destination": "C1", "volume": "35"},
+            ],
+        },
+    )
+    bid = resp.json()["batch_id"]
+    assert reverse(client, bid, "rev-multi").status_code == 201
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    assert client.get("/wells/A2").json()["volume"] == "60"
+    assert client.get("/wells/B1").status_code == 404
+    assert client.get("/wells/C1").status_code == 404
+    for well in ("A1", "A2"):
+        assert_invariant(client, well)
+
+
+def test_reversal_same_well_touched_twice_in_batch(client):
+    """同一批内多次触及同一孔：每孔仅一条标记事件，撤销仍按批前快照恢复。"""
+    register(client, "A1", "S1", "0.000000005")
+    register(client, "A1", "S2", "0.000000003")
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": "twice-1",
+            "operations": [
+                {"source": "A1", "destination": "B1", "volume": "0.000000002"},
+                {"source": "A1", "destination": "B2", "volume": "0.000000001"},
+            ],
+        },
+    )
+    bid = resp.json()["batch_id"]
+    assert reverse(client, bid, "rev-twice").status_code == 201
+
+    a1 = assert_invariant(client, "A1")
+    assert amounts(a1) == {
+        "S1": Decimal("0.000000005"),
+        "S2": Decimal("0.000000003"),
+    }
+    assert client.get("/wells/B1").status_code == 404
+    assert client.get("/wells/B2").status_code == 404
+
+
+def test_reversal_conflict_is_atomic(client):
+    """冲突时不写任何撤销记录、不改液体；之后排除阻塞仍可成功撤销。"""
+    register(client, "A1", "S1", "100")
+    bid = committed_batch_id(client, "atm-1", "A1", "B1", "40")
+    register(client, "A1", "S1", "5")  # 补液阻塞
+    assert reverse(client, bid, "rev-atm").status_code == 409
+
+    import os
+    import sqlite3
+
+    conn = sqlite3.connect(os.environ["LINEAGE_DB"])
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM reversals").fetchone()[0] == 0
+    finally:
+        conn.close()
