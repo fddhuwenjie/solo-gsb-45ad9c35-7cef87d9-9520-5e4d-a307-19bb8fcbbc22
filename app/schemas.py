@@ -70,3 +70,17 @@ class BatchCreate(BaseModel):
         if not value:
             raise ValueError("request_key 不能为空")
         return value
+
+
+class ReversalCreate(BaseModel):
+    """撤销已提交批次的请求；request_key 用于幂等去重（与批次的键空间相互独立）。"""
+
+    request_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("request_key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("request_key 不能为空")
+        return value

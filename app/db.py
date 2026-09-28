@@ -49,6 +49,49 @@ CREATE TABLE IF NOT EXISTS operations (
 
 CREATE INDEX IF NOT EXISTS idx_operations_batch ON operations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_operations_well ON operations(source, destination);
+
+-- 批前快照：批次首次触及某孔（作为来源或目标）之前该孔的完整状态。
+-- existed=0 表示该孔在批前尚未登记（撤销时须连孔一起删除）。
+CREATE TABLE IF NOT EXISTS batch_well_snapshots (
+    batch_id  INTEGER NOT NULL REFERENCES batches(id),
+    well      TEXT NOT NULL,
+    existed   INTEGER NOT NULL,
+    volume    TEXT NOT NULL,
+    PRIMARY KEY (batch_id, well)
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_composition (
+    batch_id  INTEGER NOT NULL REFERENCES batches(id),
+    well      TEXT NOT NULL,
+    sample_id INTEGER NOT NULL REFERENCES samples(id),
+    amount    TEXT NOT NULL,
+    PRIMARY KEY (batch_id, well, sample_id)
+);
+
+-- 撤销审计记录：不删除原批次，仅在此登记一次原子撤销。
+CREATE TABLE IF NOT EXISTS reversals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    batch_id    INTEGER NOT NULL REFERENCES batches(id),
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reversals_batch ON reversals(batch_id);
+
+-- 补液审计：记录每次 POST /wells 发生时已提交批次的最大 id，
+-- 供撤销时判断「该孔之后是否有补液」。上线前的补液不在表中——
+-- 但上线前批次同样没有快照，本来就不可撤销。
+CREATE TABLE IF NOT EXISTS registrations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    well            TEXT NOT NULL,
+    sample          TEXT NOT NULL,
+    volume          TEXT NOT NULL,
+    after_batch_id  INTEGER,
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_registrations_well_batch
+    ON registrations(well, after_batch_id);
 """
 
 
